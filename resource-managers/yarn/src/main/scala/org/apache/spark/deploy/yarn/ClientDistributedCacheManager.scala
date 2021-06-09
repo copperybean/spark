@@ -20,13 +20,12 @@ package org.apache.spark.deploy.yarn
 import java.net.URI
 
 import scala.collection.mutable.{HashMap, ListBuffer, Map}
-
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.apache.hadoop.fs.permission.FsAction
+import org.apache.hadoop.security.AccessControlException
 import org.apache.hadoop.yarn.api.records._
 import org.apache.hadoop.yarn.util.{ConverterUtils, Records}
-
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.yarn.config._
 import org.apache.spark.internal.Logging
@@ -158,10 +157,14 @@ private[spark] class ClientDistributedCacheManager() extends Logging {
       path: Path,
       action: FsAction,
       statCache: Map[URI, FileStatus]): Boolean = {
-    val status = getFileStatus(fs, path.toUri(), statCache)
-    val perms = status.getPermission()
-    val otherAction = perms.getOtherAction()
-    otherAction.implies(action)
+    try {
+      val status = getFileStatus(fs, path.toUri(), statCache)
+      val perms = status.getPermission()
+      val otherAction = perms.getOtherAction()
+      otherAction.implies(action)
+    } catch {
+      case _: AccessControlException => false
+    }
   }
 
   /**
