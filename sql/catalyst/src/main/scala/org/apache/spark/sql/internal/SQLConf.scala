@@ -1062,6 +1062,20 @@ object SQLConf {
     .booleanConf
     .createWithDefault(true)
 
+  val CLICKHOUSE_EXECUTOR_ENABLED = buildConf("spark.sql.execution.clickhouse")
+    .internal()
+    .doc("When true, ClickHouse executor will be used.")
+    .version("3.0.1")
+    .booleanConf
+    .createWithDefault(false)
+
+  val CLICKHOUSE_BIN_PATH = buildConf("spark.sql.clickhouse.path")
+    .internal()
+    .doc("The path of clickhouse binary.")
+    .version("3.0.1")
+    .stringConf
+    .createWithDefault("/usr/bin/clickhouse")
+
   val WHOLESTAGE_CODEGEN_USE_ID_IN_CLASS_NAME =
     buildConf("spark.sql.codegen.useIdInClassName")
     .internal()
@@ -2824,6 +2838,10 @@ class SQLConf extends Serializable with Logging {
   def optimizerMetadataOnly: Boolean = getConf(OPTIMIZER_METADATA_ONLY)
 
   def wholeStageEnabled: Boolean = getConf(WHOLESTAGE_CODEGEN_ENABLED)
+
+  def clickhouseEnabled: Boolean = getConf(CLICKHOUSE_EXECUTOR_ENABLED)
+
+  def clickhouseBinPath: String = getConf(CLICKHOUSE_BIN_PATH)
 
   def wholeStageUseIdInClassName: Boolean = getConf(WHOLESTAGE_CODEGEN_USE_ID_IN_CLASS_NAME)
 
