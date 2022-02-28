@@ -1491,6 +1491,20 @@ package object config {
       .booleanConf
       .createWithDefault(false)
 
+  private[spark] val SHUFFLE_USE_DFS =
+    ConfigBuilder("spark.shuffle.use.dfs")
+      .doc("whether use dfs shuffle.")
+      .version("3.2.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val SHUFFLE_DFS_PREFIX =
+    ConfigBuilder("spark.shuffle.dfs.prefix")
+      .doc("the prefix.")
+      .version("3.2.0")
+      .stringConf
+      .createWithDefault("/tmp")
+
   private[spark] val SHUFFLE_UNSAFE_FAST_MERGE_ENABLE =
     ConfigBuilder("spark.shuffle.unsafe.fastMergeEnabled")
       .doc("Whether to perform a fast spill merge.")

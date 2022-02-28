@@ -36,6 +36,8 @@ import scala.util.control.NonFatal
 import com.codahale.metrics.{MetricRegistry, MetricSet}
 import com.google.common.cache.CacheBuilder
 import org.apache.commons.io.IOUtils
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.Path
 
 import org.apache.spark._
 import org.apache.spark.executor.DataReadMethod
@@ -1351,6 +1353,38 @@ private[spark] class BlockManager(
       syncWrites, writeMetrics, blockId)
   }
 
+  lazy val dfsShuffleConf: Configuration = {
+    new Configuration()
+  }
+
+  lazy val dfsShufflePath: Path = {
+    val path = new Path(conf.get(config.SHUFFLE_DFS_PREFIX))
+    // val path = SparkContext.getActive.map(context => new Path(pathPrefix, context.applicationId))
+    //   .getOrElse(pathPrefix)
+    val fs = path.getFileSystem(dfsShuffleConf)
+    if (!fs.exists(path)) {
+      fs.mkdirs(path)
+    }
+    path
+  }
+
+  def getDFSShuffleFileName(
+      shuffleId: Int,
+      mapId: Long,
+      reduceId: Int): String = s"shuffle-$shuffleId-$mapId-$reduceId"
+
+  def getDFSWriter(
+      blockId: BlockId,
+      fileName: String,
+      serializerInstance: SerializerInstance,
+      bufferSize: Int,
+      writeMetrics: ShuffleWriteMetricsReporter): DFSBlockObjectWriter = {
+    val syncWrites = conf.get(config.SHUFFLE_SYNC)
+    val file = new Path(dfsShufflePath, fileName)
+    new DFSBlockObjectWriter(file, dfsShuffleConf, serializerManager, serializerInstance,
+      bufferSize, syncWrites, writeMetrics, blockId)
+  }
+
   /**
    * Put a new block of serialized bytes to the block manager.
    *
@@ -1991,6 +2025,14 @@ private[spark] class BlockManager(
     blockInfoManager.clear()
     memoryStore.clear()
     futureExecutionContext.shutdownNow()
+    try {
+      val fs = dfsShufflePath.getFileSystem(dfsShuffleConf)
+      if (fs.exists(dfsShufflePath) && !fs.delete(dfsShufflePath, true)) {
+        logError(s"failed to delete dfs shuffle path $dfsShufflePath")
+      }
+    } catch {
+      case _: Throwable => // do nothing
+    }
     logInfo("BlockManager stopped")
   }
 }

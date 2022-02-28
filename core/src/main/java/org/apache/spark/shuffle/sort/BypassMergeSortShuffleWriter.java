@@ -23,9 +23,11 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.channels.FileChannel;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.zip.Checksum;
 import javax.annotation.Nullable;
 
+import org.apache.spark.util.collection.PairsWriter;
 import scala.None$;
 import scala.Option;
 import scala.Product2;
@@ -33,6 +35,7 @@ import scala.Tuple2;
 import scala.collection.Iterator;
 
 import com.google.common.io.Closeables;
+import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -95,12 +98,13 @@ final class BypassMergeSortShuffleWriter<K, V>
   private final ShuffleExecutorComponents shuffleExecutorComponents;
 
   /** Array of file writers, one for each partition */
-  private DiskBlockObjectWriter[] partitionWriters;
+  private PairsWriter[] partitionWriters;
   private FileSegment[] partitionWriterSegments;
   @Nullable private MapStatus mapStatus;
   private long[] partitionLengths;
   /** Checksum calculator for each partition. Empty when shuffle checksum disabled. */
   private final Checksum[] partitionChecksums;
+  private Boolean useDFSShuffle;
 
   /**
    * Are we in the process of stopping? Because map tasks can call stop() with success = true
@@ -129,6 +133,7 @@ final class BypassMergeSortShuffleWriter<K, V>
     this.serializer = dep.serializer();
     this.shuffleExecutorComponents = shuffleExecutorComponents;
     this.partitionChecksums = createPartitionChecksums(numPartitions, conf);
+    this.useDFSShuffle = conf.getBoolean("spark.shuffle.use.dfs", false);
   }
 
   @Override
@@ -146,7 +151,50 @@ final class BypassMergeSortShuffleWriter<K, V>
       }
       final SerializerInstance serInstance = serializer.newInstance();
       final long openStartTime = System.nanoTime();
-      partitionWriters = new DiskBlockObjectWriter[numPartitions];
+
+      if (useDFSShuffle) {
+        DFSBlockObjectWriter[] dfsPartitionWriters = new DFSBlockObjectWriter[numPartitions];
+        partitionWriterSegments = new FileSegment[0];
+        for (int i = 0; i < numPartitions; i++) {
+          final BlockId blockId = new TempShuffleBlockId(UUID.randomUUID());
+          String fileName = blockManager.getDFSShuffleFileName(shuffleId, mapId, i);
+          DFSBlockObjectWriter writer =
+                  blockManager.getDFSWriter(blockId, fileName, serInstance, fileBufferSize, writeMetrics);
+          if (partitionChecksums.length > 0) {
+            writer.setChecksum(partitionChecksums[i]);
+          }
+          dfsPartitionWriters[i] = writer;
+        }
+        // Creating the file to write to and creating a disk writer both involve interacting with
+        // the disk, and can take a long time in aggregate when we open many files, so should be
+        // included in the shuffle write time.
+        writeMetrics.incWriteTime(System.nanoTime() - openStartTime);
+
+        while (records.hasNext()) {
+          final Product2<K, V> record = records.next();
+          final K key = record._1();
+          dfsPartitionWriters[partitioner.getPartition(key)].write(key, record._2());
+        }
+
+        partitionLengths = new long[numPartitions];
+        for (int i = 0; i < numPartitions; i++) {
+          try (DFSBlockObjectWriter writer = dfsPartitionWriters[i]) {
+            if (writer.getNumRecordsWritten() > 0) {
+              partitionLengths[i] = 100;
+            } else {
+              partitionLengths[i] = 0;
+            }
+            writer.commit();
+          }
+        }
+
+        partitionWriters = dfsPartitionWriters;
+        mapStatus = MapStatus$.MODULE$.apply(
+                blockManager.shuffleServerId(), partitionLengths, mapId);
+        return;
+      }
+
+      DiskBlockObjectWriter[] filePartitionWriters = new DiskBlockObjectWriter[numPartitions];
       partitionWriterSegments = new FileSegment[numPartitions];
       for (int i = 0; i < numPartitions; i++) {
         final Tuple2<TempShuffleBlockId, File> tempShuffleBlockIdPlusFile =
@@ -158,7 +206,7 @@ final class BypassMergeSortShuffleWriter<K, V>
         if (partitionChecksums.length > 0) {
           writer.setChecksum(partitionChecksums[i]);
         }
-        partitionWriters[i] = writer;
+        filePartitionWriters[i] = writer;
       }
       // Creating the file to write to and creating a disk writer both involve interacting with
       // the disk, and can take a long time in aggregate when we open many files, so should be
@@ -168,15 +216,16 @@ final class BypassMergeSortShuffleWriter<K, V>
       while (records.hasNext()) {
         final Product2<K, V> record = records.next();
         final K key = record._1();
-        partitionWriters[partitioner.getPartition(key)].write(key, record._2());
+        filePartitionWriters[partitioner.getPartition(key)].write(key, record._2());
       }
 
       for (int i = 0; i < numPartitions; i++) {
-        try (DiskBlockObjectWriter writer = partitionWriters[i]) {
+        try (DiskBlockObjectWriter writer = filePartitionWriters[i]) {
           partitionWriterSegments[i] = writer.commitAndGet();
         }
       }
 
+      partitionWriters = filePartitionWriters;
       partitionLengths = writePartitionedData(mapOutputWriter);
       mapStatus = MapStatus$.MODULE$.apply(
         blockManager.shuffleServerId(), partitionLengths, mapId);
@@ -285,9 +334,23 @@ final class BypassMergeSortShuffleWriter<K, V>
         return Option.apply(mapStatus);
       } else {
         // The map task failed, so delete our output data.
-        if (partitionWriters != null) {
+        if (partitionWriters != null && useDFSShuffle) {
           try {
-            for (DiskBlockObjectWriter writer : partitionWriters) {
+            for (DFSBlockObjectWriter writer : (DFSBlockObjectWriter[]) partitionWriters) {
+              // This method explicitly does _not_ throw exceptions:
+              Path file = writer.revertPartialWritesAndClose();
+              if (!file.getFileSystem(blockManager.dfsShuffleConf()).delete(file, true)) {
+                logger.error("Error while deleting file {}", file.toString());
+              }
+            }
+          } catch (IOException e) {
+            logger.error("Error while deleting file", e);
+          } finally {
+            partitionWriters = null;
+          }
+        } else if (partitionWriters != null) {
+          try {
+            for (DiskBlockObjectWriter writer : (DiskBlockObjectWriter[]) partitionWriters) {
               // This method explicitly does _not_ throw exceptions:
               File file = writer.revertPartialWritesAndClose();
               if (!file.delete()) {
